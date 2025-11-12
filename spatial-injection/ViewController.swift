@@ -7,13 +7,16 @@
 import UIKit
 import RealityKit
 import ARKit
+import Vision
 
 class ViewController: UIViewController {
     var arView: ARView!  // Changed: removed @IBOutlet since we're creating it programmatically
+    var overlayView = DetectionOverlayView()
     
     var dataCollector: ARDataCollector!
     var objectDetector = ObjectDetector()
     let llm = LLMConnector()
+    var displayLink: CADisplayLink?
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -21,6 +24,12 @@ class ViewController: UIViewController {
         // Create ARView programmatically
         arView = ARView(frame: view.bounds)
         view.addSubview(arView)
+        
+        // Add overlay view on top of arView
+        overlayView.frame = arView.bounds
+        overlayView.backgroundColor = .clear
+        overlayView.isUserInteractionEnabled = false
+        arView.addSubview(overlayView)
         
         // Start AR with depth
         let config = ARWorldTrackingConfiguration()
@@ -43,6 +52,16 @@ class ViewController: UIViewController {
         // Add tap gesture recognizer for manual override
         let tap = UITapGestureRecognizer(target: self, action: #selector(manualMarkObject(_:)))
         arView.addGestureRecognizer(tap)
+        
+        // Setup CADisplayLink to refresh overlay each frame
+        displayLink = CADisplayLink(target: self, selector: #selector(updateOverlay))
+        displayLink?.add(to: .main, forMode: .common)
+    }
+    
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        arView.frame = view.bounds
+        overlayView.frame = arView.bounds
     }
     
     @objc func captureAndAnalyze() {
@@ -69,20 +88,42 @@ class ViewController: UIViewController {
         }
     }
     
-    @objc func manualMarkObject(_ sender: UITapGestureRecognizer) {
-        let location = sender.location(in: arView)
-        // Simple raycast into the scene
-        if let result = arView.raycast(from: location, allowing: .estimatedPlane, alignment: .any).first {
-            // For demo: mark a person at this location with approximate height
-            let position = simd_float3(result.worldTransform.columns.3.x,
-                                       result.worldTransform.columns.3.y,
-                                       result.worldTransform.columns.3.z)
-            var context = dataCollector.currentSpatialContext
-            let person = DetectedObject(label: "person", position: position, boundingBox: nil, confidence: 1.0)
-            context.objects.append(person)
-            dataCollector.currentSpatialContext = context
-            print("Manual override: marked person at \(position)")
+    @objc func updateOverlay() {
+        guard let frame = arView.session.currentFrame else { return }
+        // Get latest observations from objectDetector
+        let observations = objectDetector.lastObservations
+        // Map normalized Vision boxes to view-space rects
+        let size = overlayView.bounds.size
+        let rects: [CGRect] = observations.map { obs in
+            let bb = obs.boundingBox // normalized in Vision space (origin bottom-left)
+            let x = bb.origin.x * size.width
+            let y = (1 - bb.origin.y - bb.height) * size.height
+            let w = bb.width * size.width
+            let h = bb.height * size.height
+            return CGRect(x: x, y: y, width: w, height: h)
         }
+        overlayView.observations = rects
+    }
+    
+    @objc func manualMarkObject(_ sender: UITapGestureRecognizer) {
+        let alert = UIAlertController(title: "Mark Object", message: "Choose a label for the tapped point", preferredStyle: .actionSheet)
+        let labels = ["person", "door", "shelf", "ladder", "vehicle"]
+        for label in labels {
+            alert.addAction(UIAlertAction(title: label, style: .default, handler: { _ in
+                let location = sender.location(in: self.arView)
+                if let result = self.arView.raycast(from: location, allowing: .estimatedPlane, alignment: .any).first {
+                    let position = simd_float3(result.worldTransform.columns.3.x,
+                                               result.worldTransform.columns.3.y,
+                                               result.worldTransform.columns.3.z)
+                    var context = self.dataCollector.currentSpatialContext
+                    let obj = DetectedObject(label: label, position: position, boundingBox: nil, confidence: 1.0)
+                    context.objects.append(obj)
+                    self.dataCollector.currentSpatialContext = context
+                    print("Manual override: marked \(label) at \(position)")
+                }
+            }))
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
     }
 }
-

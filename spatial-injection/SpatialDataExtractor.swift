@@ -41,6 +41,41 @@ struct SpatialContext {
         
         return prompt
     }
+    
+    func toSummary() -> String {
+        var lines: [String] = []
+        // Basic distances
+        if let center = distances["center_point"] {
+            lines.append(String(format: "Center distance: %.2fm", center))
+        }
+        // Simple heuristics for reachability and clearance
+        let personHeights: [Float] = objects.filter { $0.label == "person" }.map { _ in 1.7 }
+        let maxReach = personHeights.map { MeasurementCalculator.estimatePersonReach(heightMeters: $0) }.max() ?? 0
+        // Infer a shelf height from any object labeled 'shelf' using its z as distance; we don't have height, so treat z as distance and make a conservative guess
+        // For demo: if we have a plane classified as 'table' or 'ceiling', create simple statements
+        if maxReach > 0 {
+            lines.append(String(format: "Max human reach (est.): %.2fm", maxReach))
+        }
+        // List detected objects with approximate distance (z)
+        for obj in objects {
+            lines.append(String(format: "%@ at ~%.2fm away (conf: %.0f%%)", obj.label, obj.position.z, obj.confidence * 100))
+        }
+        // Surfaces summary
+        for plane in planes {
+            lines.append(String(format: "Surface: %@ (%.2fm x %.2fm)", plane.classification, plane.width, plane.height))
+        }
+        // Opinionated conclusion examples
+        if maxReach > 0 {
+            // If any object named 'shelf' exists, assume shelf height 2.4m for demo
+            let hasShelf = objects.contains { $0.label == "shelf" }
+            if hasShelf {
+                let shelfHeight: Float = 2.4
+                let canReach = MeasurementCalculator.canReach(targetHeight: shelfHeight, personHeight: 1.7)
+                lines.append(canReach ? "A person can likely reach the shelf (2.4m)." : "A person likely cannot reach the 2.4m shelf without a ladder.")
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
 }
 
 struct DetectedObject {
