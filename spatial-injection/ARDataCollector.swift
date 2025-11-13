@@ -11,17 +11,25 @@ import Vision
 class ARDataCollector: NSObject, ARSessionDelegate {
     var currentSpatialContext = SpatialContext()
     var arView: ARView
-    private let detector = ObjectDetector()
+    private let detector: ObjectDetector
     private var lastDetections: [DetectedObject] = []
+    private var manualOverrides: [DetectedObject] = []
     
-    init(arView: ARView) {
+    var lastVisionObservations: [VNRecognizedObjectObservation] {
+        detector.lastObservations
+    }
+    
+    init(arView: ARView, detector: ObjectDetector) {
         self.arView = arView
+        self.detector = detector
         super.init()
         arView.session.delegate = self
     }
     
     // This gets called every frame
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        currentSpatialContext.cameraTransform = frame.camera.transform
+        
         // Extract depth distance at center of screen
         if let depth = frame.sceneDepth {
             let centerDistance = getCenterDistance(from: depth.depthMap)
@@ -32,9 +40,31 @@ class ARDataCollector: NSObject, ARSessionDelegate {
         updateDetectedPlanes(from: frame.anchors)
         
         detector.detectObjects(in: frame) { [weak self] objects in
-            self?.lastDetections = objects
-            self?.currentSpatialContext.objects = objects
+            guard let self = self else { return }
+            self.lastDetections = objects
+            
+            var context = self.currentSpatialContext
+            context.objects = objects
+            if !self.manualOverrides.isEmpty {
+                context.objects.append(contentsOf: self.manualOverrides)
+            }
+            self.currentSpatialContext = context
         }
+    }
+    
+    func addManualOverride(_ object: DetectedObject) {
+        manualOverrides.append(object)
+        var context = currentSpatialContext
+        context.objects.append(object)
+        currentSpatialContext = context
+    }
+    
+    func clearManualOverrides() {
+        manualOverrides.removeAll()
+        
+        var context = currentSpatialContext
+        context.objects = lastDetections
+        currentSpatialContext = context
     }
     
     func getCenterDistance(from depthMap: CVPixelBuffer) -> Float {

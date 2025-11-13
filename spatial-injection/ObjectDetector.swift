@@ -8,6 +8,7 @@
 import Vision
 import CoreML
 import ARKit
+import UIKit
 
 #if canImport(CoreML)
 private func makeYOLOModel() -> VNCoreMLModel? {
@@ -21,6 +22,7 @@ private func makeYOLOModel() -> VNCoreMLModel? {
 
 class ObjectDetector {
     public private(set) var lastObservations: [VNRecognizedObjectObservation] = []
+    public private(set) var lastDetections: [DetectedObject] = []
     
     private lazy var request: VNRequest = {
         let completionHandler: VNRequestCompletionHandler = { [weak self] request, error in
@@ -48,81 +50,110 @@ class ObjectDetector {
     // Store latest depth map for sampling during detection
     private var latestDepthMap: CVPixelBuffer?
     private var latestImageSize: CGSize?
+    private var latestCameraIntrinsics = simd_float3x3()
+    private var latestCameraTransform = matrix_identity_float4x4
+    
+    private var isProcessing = false
+    private var lastRequestTimestamp: TimeInterval = 0
+    private let minimumRequestInterval: TimeInterval = 0.12
+    private let processingQueue = DispatchQueue(label: "com.spatialinjection.objectdetector", qos: .userInitiated)
     
     func detectObjects(in frame: ARFrame, completion: @escaping ([DetectedObject]) -> Void) {
+        let timestamp = frame.timestamp
+        
+        if isProcessing || (timestamp - lastRequestTimestamp) < minimumRequestInterval {
+            let cachedDetections = lastDetections
+            DispatchQueue.main.async {
+                completion(cachedDetections)
+            }
+            return
+        }
+        
+        completionHandler = completion
+        isProcessing = true
+        lastRequestTimestamp = timestamp
+        
+        latestDepthMap = frame.sceneDepth?.depthMap
         let pixelBuffer = frame.capturedImage
-        let depthMap = frame.sceneDepth?.depthMap
+        latestImageSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                                 height: CVPixelBufferGetHeight(pixelBuffer))
+        latestCameraIntrinsics = frame.camera.intrinsics
+        latestCameraTransform = frame.camera.transform
         
-        self.completionHandler = completion
-        self.latestDepthMap = depthMap
-        self.latestImageSize = CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
-                                      height: CVPixelBufferGetHeight(pixelBuffer))
+        var intrinsics = frame.camera.intrinsics
+        let intrinsicsData = NSData(bytes: &intrinsics, length: MemoryLayout.size(ofValue: intrinsics))
+        let orientation = currentImageOrientation()
         
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer)
+        let handler = VNImageRequestHandler(
+            cvPixelBuffer: pixelBuffer,
+            orientation: orientation,
+            options: [.cameraIntrinsics: intrinsicsData]
+        )
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        processingQueue.async { [weak self] in
+            guard let self = self else { return }
             do {
-                try handler.perform([self?.request].compactMap { $0 })
+                try handler.perform([self.request])
             } catch {
                 DispatchQueue.main.async {
-                    completion([])
+                    self.isProcessing = false
+                    self.lastDetections = []
+                    self.completionHandler?([])
+                    self.completionHandler = nil
                 }
             }
         }
     }
     
     private func handleDetections(_ observations: [VNRecognizedObjectObservation]) {
-        guard let completion = completionHandler else { return }
+        lastObservations = observations
         
-        self.lastObservations = observations
+        var detectedObjects: [DetectedObject] = []
         
-        // We do this on a background queue to avoid blocking Vision
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
+        for observation in observations where observation.confidence > 0.7 {
+            let boundingBox = observation.boundingBox
+            let midX = boundingBox.midX
+            let midY = boundingBox.midY
+            let midXFloat = Float(midX)
+            let midYFloat = Float(midY)
             
-            var detectedObjects: [DetectedObject] = []
+            var zMeters: Float = 0
+            var worldPosition: simd_float3?
             
-            for observation in observations where observation.confidence > 0.7 {
-                let boundingBox = observation.boundingBox
-                let xNorm = boundingBox.midX
-                let yNorm = boundingBox.midY
-                let xNormF = Float(xNorm)
-                let yNormF = Float(yNorm)
-                
-                var zMeters: Float = 0
-                
-                if let depthMap = self.latestDepthMap {
-                    // Convert normalized coordinates to pixel coordinates in depth map space
-                    let width = CVPixelBufferGetWidth(depthMap)
-                    let height = CVPixelBufferGetHeight(depthMap)
-                    let pixelXFloat = xNormF * Float(width)
-                    let pixelYFloat = (1 - yNormF) * Float(height)
-                    let pixelX = Int(self.clamp(Int(round(pixelXFloat)), 0, width - 1))
-                    let pixelY = Int(self.clamp(Int(round(pixelYFloat)), 0, height - 1))
-                    zMeters = self.sampleDepth(atX: pixelX, y: pixelY, from: depthMap)
-                }
-                
-                let label = observation.labels.first?.identifier ?? "unknown"
-                
-                // boundingBox is left as nil here; actual VNRecognizedObjectObservation is exposed via lastObservations
-                // Width/height in meters could be computed if needed in future
-                detectedObjects.append(
-                    DetectedObject(
-                        label: label,
-                        position: simd_float3(xNormF, yNormF, zMeters),
-                        boundingBox: nil,
-                        confidence: observation.confidence
-                    )
+            if let depthMap = latestDepthMap {
+                let width = CVPixelBufferGetWidth(depthMap)
+                let height = CVPixelBufferGetHeight(depthMap)
+                let pixelXFloat = midXFloat * Float(width)
+                let pixelYFloat = (1 - midYFloat) * Float(height)
+                let pixelX = Int(clamp(Int(round(pixelXFloat)), 0, width - 1))
+                let pixelY = Int(clamp(Int(round(pixelYFloat)), 0, height - 1))
+                zMeters = sampleDepth(atX: pixelX, y: pixelY, from: depthMap, kernelRadius: 1)
+                worldPosition = worldPositionForPixel(x: pixelXFloat, y: pixelYFloat, depth: zMeters)
+            }
+            
+            let label = observation.labels.first?.identifier ?? "unknown"
+            
+            detectedObjects.append(
+                DetectedObject(
+                    label: label,
+                    position: simd_float3(midXFloat, midYFloat, zMeters),
+                    boundingBox: nil,
+                    confidence: observation.confidence,
+                    worldPosition: worldPosition
                 )
-            }
-            
-            DispatchQueue.main.async {
-                completion(detectedObjects)
-            }
+            )
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.lastDetections = detectedObjects
+            self.completionHandler?(detectedObjects)
+            self.completionHandler = nil
+            self.isProcessing = false
         }
     }
     
-    private func sampleDepth(atX x: Int, y: Int, from depthMap: CVPixelBuffer) -> Float {
+    private func sampleDepth(atX x: Int, y: Int, from depthMap: CVPixelBuffer, kernelRadius: Int = 0) -> Float {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -135,10 +166,31 @@ class ObjectDetector {
         
         if pixelFormat == kCVPixelFormatType_DepthFloat32 {
             let floatBuffer = baseAddress.assumingMemoryBound(to: Float32.self)
-            let index = y * (rowBytes / MemoryLayout<Float32>.size) + x
-            if index >= 0 && index < width * height {
-                let depthValue = floatBuffer[index]
-                return max(0, depthValue)
+            let stride = rowBytes / MemoryLayout<Float32>.size
+            var total: Float = 0
+            var samples: Float = 0
+            let radius = max(0, kernelRadius)
+            
+            let minY = max(0, y - radius)
+            let maxY = min(height - 1, y + radius)
+            let minX = max(0, x - radius)
+            let maxX = min(width - 1, x + radius)
+            
+            for yy in minY...maxY {
+                for xx in minX...maxX {
+                    let index = yy * stride + xx
+                    if index >= 0 && index < stride * height {
+                        let depthValue = floatBuffer[index]
+                        if depthValue.isFinite && depthValue > 0 {
+                            total += depthValue
+                            samples += 1
+                        }
+                    }
+                }
+            }
+            
+            if samples > 0 {
+                return total / samples
             }
         }
         
@@ -149,5 +201,39 @@ class ObjectDetector {
         if value < min { return min }
         if value > max { return max }
         return value
+    }
+    
+    private func worldPositionForPixel(x: Float, y: Float, depth: Float) -> simd_float3? {
+        guard depth.isFinite, depth > 0 else { return nil }
+        
+        let fx = latestCameraIntrinsics.columns.0.x
+        let fy = latestCameraIntrinsics.columns.1.y
+        let cx = latestCameraIntrinsics.columns.2.x
+        let cy = latestCameraIntrinsics.columns.2.y
+        
+        guard fx != 0, fy != 0 else { return nil }
+        
+        let normalizedX = (x - cx) / fx
+        let normalizedY = (y - cy) / fy
+        
+        let cameraSpacePoint = simd_float4(normalizedX * depth,
+                                           normalizedY * depth,
+                                           depth,
+                                           1)
+        let worldPoint = latestCameraTransform * cameraSpacePoint
+        return simd_float3(worldPoint.x, worldPoint.y, worldPoint.z)
+    }
+    
+    private func currentImageOrientation() -> CGImagePropertyOrientation {
+        switch UIDevice.current.orientation {
+        case .landscapeLeft:
+            return .up
+        case .landscapeRight:
+            return .down
+        case .portraitUpsideDown:
+            return .left
+        default:
+            return .right
+        }
     }
 }

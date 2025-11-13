@@ -49,13 +49,24 @@ class ViewController: UIViewController {
         
         // Start AR with depth
         let config = ARWorldTrackingConfiguration()
-        config.sceneReconstruction = .meshWithClassification
-        config.frameSemantics = .sceneDepth
         
-        arView.session.run(config)
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
+            config.sceneReconstruction = .meshWithClassification
+        }
+        
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
+        }
+        
+        config.planeDetection = [.horizontal, .vertical]
+        
+        arView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         
         // Initialize data collector
-        dataCollector = ARDataCollector(arView: arView)
+        dataCollector = ARDataCollector(arView: arView, detector: objectDetector)
         
         // Analyze button
         analyzeButton.setTitle("Analyze", for: .normal)
@@ -138,7 +149,7 @@ class ViewController: UIViewController {
         }
         
         // Get latest observations from objectDetector
-        let observations = objectDetector.lastObservations
+        let observations = dataCollector.lastVisionObservations
         // Map normalized Vision boxes to view-space rects
         let size = overlayView.bounds.size
         let rects: [CGRect] = observations.map { obs in
@@ -162,10 +173,8 @@ class ViewController: UIViewController {
                     let position = simd_float3(result.worldTransform.columns.3.x,
                                                result.worldTransform.columns.3.y,
                                                result.worldTransform.columns.3.z)
-                    var context = self.dataCollector.currentSpatialContext
-                    let obj = DetectedObject(label: label, position: position, boundingBox: nil, confidence: 1.0)
-                    context.objects.append(obj)
-                    self.dataCollector.currentSpatialContext = context
+                    let obj = DetectedObject(label: label, position: position, boundingBox: nil, confidence: 1.0, worldPosition: position)
+                    self.dataCollector.addManualOverride(obj)
                     print("Manual override: marked \(label) at \(position)")
                 }
             }))
@@ -210,9 +219,18 @@ class ViewController: UIViewController {
             empty.font = .systemFont(ofSize: 15)
             stack.addArrangedSubview(empty)
         } else {
+            let cameraTransform = dataCollector.currentSpatialContext.cameraTransform
+            let cameraPosition = simd_float3(cameraTransform.columns.3.x,
+                                             cameraTransform.columns.3.y,
+                                             cameraTransform.columns.3.z)
             for o in objs {
                 let lbl = UILabel()
-                let distance = o.position.z
+                let distance: Float
+                if let world = o.worldPosition {
+                    distance = simd_length(world - cameraPosition)
+                } else {
+                    distance = o.position.z
+                }
                 lbl.text = String(format: "%@ — %.2f m", o.label, distance)
                 lbl.textColor = .label
                 lbl.font = .systemFont(ofSize: 15)

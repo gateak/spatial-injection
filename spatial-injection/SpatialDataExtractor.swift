@@ -13,6 +13,7 @@ struct SpatialContext {
     var objects: [DetectedObject] = []
     var distances: [String: Float] = [:]
     var planes: [DetectedPlane] = []
+    var cameraTransform: simd_float4x4 = matrix_identity_float4x4
     
     // Convert to LLM-friendly format
     func toLLMPrompt() -> String {
@@ -27,7 +28,8 @@ struct SpatialContext {
         // Add detected objects
         prompt += "\nOBJECTS:\n"
         for obj in objects {
-            prompt += "- \(obj.label) at position (\(String(format: "%.2f", obj.position.x)), \(String(format: "%.2f", obj.position.y)), \(String(format: "%.2f", obj.position.z)))m\n"
+            let position = obj.worldPosition ?? obj.position
+            prompt += "- \(obj.label) at position (\(String(format: "%.2f", position.x)), \(String(format: "%.2f", position.y)), \(String(format: "%.2f", position.z)))m\n"
             if let size = obj.boundingBox {
                 prompt += "  size: \(String(format: "%.2f", size.x))m x \(String(format: "%.2f", size.y))m x \(String(format: "%.2f", size.z))m\n"
             }
@@ -39,11 +41,21 @@ struct SpatialContext {
             prompt += "- \(plane.classification): \(String(format: "%.2f", plane.width))m x \(String(format: "%.2f", plane.height))m\n"
         }
         
+        let cameraPosition = simd_float3(cameraTransform.columns.3.x,
+                                         cameraTransform.columns.3.y,
+                                         cameraTransform.columns.3.z)
+        prompt += "\nCAMERA:\n"
+        prompt += String(format: "- position: (%.2f, %.2f, %.2f)m\n", cameraPosition.x, cameraPosition.y, cameraPosition.z)
+        
         return prompt
     }
     
     func toSummary() -> String {
         var lines: [String] = []
+        let cameraPosition = simd_float3(cameraTransform.columns.3.x,
+                                         cameraTransform.columns.3.y,
+                                         cameraTransform.columns.3.z)
+        lines.append(String(format: "Camera at (%.2f, %.2f, %.2f)m", cameraPosition.x, cameraPosition.y, cameraPosition.z))
         // Basic distances
         if let center = distances["center_point"] {
             lines.append(String(format: "Center distance: %.2fm", center))
@@ -58,7 +70,13 @@ struct SpatialContext {
         }
         // List detected objects with approximate distance (z)
         for obj in objects {
-            lines.append(String(format: "%@ at ~%.2fm away (conf: %.0f%%)", obj.label, obj.position.z, obj.confidence * 100))
+            if let world = obj.worldPosition {
+                let relative = world - cameraPosition
+                let distance = simd_length(relative)
+                lines.append(String(format: "%@ at %.2fm away (conf: %.0f%%)", obj.label, distance, obj.confidence * 100))
+            } else {
+                lines.append(String(format: "%@ approx depth %.2fm (conf: %.0f%%)", obj.label, obj.position.z, obj.confidence * 100))
+            }
         }
         // Surfaces summary
         for plane in planes {
@@ -78,11 +96,25 @@ struct SpatialContext {
     }
 }
 
-struct DetectedObject {
+struct DetectedObject: Identifiable {
+    let id = UUID()
     let label: String
     let position: simd_float3
     let boundingBox: simd_float3?
     let confidence: Float
+    let worldPosition: simd_float3?
+    
+    init(label: String,
+         position: simd_float3,
+         boundingBox: simd_float3?,
+         confidence: Float,
+         worldPosition: simd_float3? = nil) {
+        self.label = label
+        self.position = position
+        self.boundingBox = boundingBox
+        self.confidence = confidence
+        self.worldPosition = worldPosition
+    }
 }
 
 struct DetectedPlane {
