@@ -18,12 +18,28 @@ class ViewController: UIViewController {
     let llm = LLMConnector()
     var displayLink: CADisplayLink?
     
+    private let hudView = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+    private let centerDistanceLabel = UILabel()
+    private let analyzeButton = UIButton(type: .system)
+    private var detectionsPanel: UIView?
+    
     override func viewDidLoad() {
         super.viewDidLoad()
         
         // Create ARView programmatically
         arView = ARView(frame: view.bounds)
         view.addSubview(arView)
+        
+        // HUD setup for center distance
+        hudView.layer.cornerRadius = 14
+        hudView.layer.masksToBounds = true
+        view.addSubview(hudView)
+        
+        centerDistanceLabel.font = .monospacedDigitSystemFont(ofSize: 16, weight: .medium)
+        centerDistanceLabel.textColor = .label
+        centerDistanceLabel.textAlignment = .center
+        centerDistanceLabel.text = "Center: -- m"
+        hudView.contentView.addSubview(centerDistanceLabel)
         
         // Add overlay view on top of arView
         overlayView.frame = arView.bounds
@@ -41,13 +57,19 @@ class ViewController: UIViewController {
         // Initialize data collector
         dataCollector = ARDataCollector(arView: arView)
         
-        // Add capture button
-        let captureButton = UIButton(frame: CGRect(x: 50, y: 100, width: 200, height: 50))
-        captureButton.setTitle("Analyze Scene", for: .normal)
-        captureButton.backgroundColor = .systemBlue
-        captureButton.layer.cornerRadius = 10  // Added: make it look nice
-        captureButton.addTarget(self, action: #selector(captureAndAnalyze), for: .touchUpInside)
-        view.addSubview(captureButton)
+        // Analyze button
+        analyzeButton.setTitle("Analyze", for: .normal)
+        analyzeButton.tintColor = .white
+        analyzeButton.backgroundColor = .systemBlue
+        analyzeButton.titleLabel?.font = .systemFont(ofSize: 18, weight: .semibold)
+        analyzeButton.layer.cornerRadius = 22
+        analyzeButton.layer.shadowColor = UIColor.black.cgColor
+        analyzeButton.layer.shadowOpacity = 0.2
+        analyzeButton.layer.shadowRadius = 6
+        analyzeButton.layer.shadowOffset = CGSize(width: 0, height: 3)
+        analyzeButton.addTarget(self, action: #selector(captureAndAnalyze), for: .touchUpInside)
+        view.addSubview(analyzeButton)
+        view.bringSubviewToFront(analyzeButton)
         
         // Add tap gesture recognizer for manual override
         let tap = UITapGestureRecognizer(target: self, action: #selector(manualMarkObject(_:)))
@@ -62,9 +84,23 @@ class ViewController: UIViewController {
         super.viewDidLayoutSubviews()
         arView.frame = view.bounds
         overlayView.frame = arView.bounds
+        
+        let safe = view.safeAreaInsets
+        let hudWidth: CGFloat = 180
+        let hudHeight: CGFloat = 44
+        hudView.frame = CGRect(x: (view.bounds.width - hudWidth)/2, y: safe.top + 12, width: hudWidth, height: hudHeight)
+        centerDistanceLabel.frame = hudView.bounds.insetBy(dx: 12, dy: 8)
+
+        let buttonWidth: CGFloat = 160
+        let buttonHeight: CGFloat = 44
+        analyzeButton.frame = CGRect(x: (view.bounds.width - buttonWidth)/2, y: view.bounds.height - safe.bottom - buttonHeight - 20, width: buttonWidth, height: buttonHeight)
+        view.bringSubviewToFront(analyzeButton)
     }
     
     @objc func captureAndAnalyze() {
+        // If a previous panel is visible, dismiss it so the new one can appear properly
+        dismissDetectionsPanel()
+        
         // Get current spatial context
         let spatialData = dataCollector.currentSpatialContext
         
@@ -77,6 +113,10 @@ class ViewController: UIViewController {
             
             // Send to LLM
             self.sendToLLM(image: image, spatialContext: contextPrompt)
+            
+            DispatchQueue.main.async {
+                self.showDetectionsPanel()
+            }
         }
     }
     
@@ -90,6 +130,13 @@ class ViewController: UIViewController {
     
     @objc func updateOverlay() {
         guard let frame = arView.session.currentFrame else { return }
+        
+        if let d = dataCollector.currentSpatialContext.distances["center_point"], d.isFinite, d > 0 {
+            centerDistanceLabel.text = String(format: "Center: %.2f m", d)
+        } else {
+            centerDistanceLabel.text = "Center: -- m"
+        }
+        
         // Get latest observations from objectDetector
         let observations = objectDetector.lastObservations
         // Map normalized Vision boxes to view-space rects
@@ -125,5 +172,106 @@ class ViewController: UIViewController {
         }
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         present(alert, animated: true)
+    }
+    
+    private func showDetectionsPanel() {
+        // Remove existing panel if any
+        detectionsPanel?.removeFromSuperview()
+
+        let panel = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
+        panel.layer.cornerRadius = 18
+        panel.layer.masksToBounds = true
+
+        let grabber = UIView()
+        grabber.backgroundColor = UIColor.label.withAlphaComponent(0.25)
+        grabber.layer.cornerRadius = 2
+
+        let closeButton = UIButton(type: .system)
+        closeButton.setTitle("Close", for: .normal)
+        closeButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        closeButton.addTarget(self, action: #selector(dismissDetectionsPanel), for: .touchUpInside)
+
+        // Build content
+        let titleLabel = UILabel()
+        titleLabel.text = "Detections"
+        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
+        titleLabel.textColor = .label
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 8
+
+        let objs = dataCollector.currentSpatialContext.objects
+        if objs.isEmpty {
+            let empty = UILabel()
+            empty.text = "No objects detected."
+            empty.textColor = .secondaryLabel
+            empty.textAlignment = .center
+            empty.font = .systemFont(ofSize: 15)
+            stack.addArrangedSubview(empty)
+        } else {
+            for o in objs {
+                let lbl = UILabel()
+                let distance = o.position.z
+                lbl.text = String(format: "%@ — %.2f m", o.label, distance)
+                lbl.textColor = .label
+                lbl.font = .systemFont(ofSize: 15)
+                stack.addArrangedSubview(lbl)
+            }
+        }
+
+        let content = UIStackView(arrangedSubviews: [titleLabel, stack])
+        content.axis = .vertical
+        content.spacing = 12
+        content.layoutMargins = UIEdgeInsets(top: 12, left: 16, bottom: 16, right: 16)
+        content.isLayoutMarginsRelativeArrangement = true
+
+        panel.contentView.addSubview(content)
+        view.addSubview(panel)
+        view.bringSubviewToFront(analyzeButton)
+
+        // Layout
+        let safe = view.safeAreaInsets
+        let buttonBottom = analyzeButton.frame.minY
+        let horizontalMargin: CGFloat = 12
+        let width: CGFloat = view.bounds.width - horizontalMargin * 2
+        let maxHeight: CGFloat = min(300, view.bounds.height * 0.4)
+        let desiredBottomSpacing: CGFloat = 12
+        let panelBottom = buttonBottom - desiredBottomSpacing
+        let panelHeight = maxHeight
+        panel.frame = CGRect(x: horizontalMargin, y: panelBottom - panelHeight, width: width, height: panelHeight)
+
+        // Layout subviews inside panel
+        let grabberWidth: CGFloat = 36
+        let grabberHeight: CGFloat = 4
+        grabber.frame = CGRect(x: (panel.bounds.width - grabberWidth)/2, y: 8, width: grabberWidth, height: grabberHeight)
+
+        let closeSize = CGSize(width: 60, height: 28)
+        closeButton.frame = CGRect(x: panel.bounds.width - closeSize.width - 8, y: 6, width: closeSize.width, height: closeSize.height)
+
+        let contentTop: CGFloat = grabber.frame.maxY + 6
+        content.frame = panel.bounds.inset(by: UIEdgeInsets(top: contentTop + 6, left: 0, bottom: 0, right: 0))
+
+        panel.contentView.addSubview(grabber)
+        panel.contentView.addSubview(closeButton)
+
+        // Keep reference
+        detectionsPanel = panel
+
+        // Simple appear animation
+        panel.alpha = 0
+        UIView.animate(withDuration: 0.2) {
+            panel.alpha = 1
+        }
+    }
+    
+    @objc private func dismissDetectionsPanel() {
+        guard let panel = detectionsPanel else { return }
+        UIView.animate(withDuration: 0.2, animations: {
+            panel.alpha = 0
+        }, completion: { _ in
+            panel.removeFromSuperview()
+            self.detectionsPanel = nil
+        })
     }
 }
