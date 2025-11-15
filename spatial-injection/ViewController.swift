@@ -206,9 +206,19 @@ class ViewController: UIViewController {
         titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
         titleLabel.textColor = .label
 
-        let stack = UIStackView()
-        stack.axis = .vertical
-        stack.spacing = 8
+x        let sectionsStack = UIStackView()
+        sectionsStack.axis = .vertical
+        sectionsStack.spacing = 16
+
+        let objectsTitle = UILabel()
+        objectsTitle.text = "Objects"
+        objectsTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        objectsTitle.textColor = .secondaryLabel
+        sectionsStack.addArrangedSubview(objectsTitle)
+
+        let objectsStack = UIStackView()
+        objectsStack.axis = .vertical
+        objectsStack.spacing = 8
 
         let objs = dataCollector.currentSpatialContext.objects
         if objs.isEmpty {
@@ -217,7 +227,7 @@ class ViewController: UIViewController {
             empty.textColor = .secondaryLabel
             empty.textAlignment = .center
             empty.font = .systemFont(ofSize: 15)
-            stack.addArrangedSubview(empty)
+            objectsStack.addArrangedSubview(empty)
         } else {
             let cameraTransform = dataCollector.currentSpatialContext.cameraTransform
             let cameraPosition = simd_float3(cameraTransform.columns.3.x,
@@ -234,11 +244,52 @@ class ViewController: UIViewController {
                 lbl.text = String(format: "%@ — %.2f m", o.label, distance)
                 lbl.textColor = .label
                 lbl.font = .systemFont(ofSize: 15)
-                stack.addArrangedSubview(lbl)
+                objectsStack.addArrangedSubview(lbl)
             }
         }
+        sectionsStack.addArrangedSubview(objectsStack)
 
-        let content = UIStackView(arrangedSubviews: [titleLabel, stack])
+        let surfacesTitle = UILabel()
+        surfacesTitle.text = "World Surfaces"
+        surfacesTitle.font = .systemFont(ofSize: 15, weight: .semibold)
+        surfacesTitle.textColor = .secondaryLabel
+        sectionsStack.addArrangedSubview(surfacesTitle)
+
+        let planesStack = UIStackView()
+        planesStack.axis = .vertical
+        planesStack.spacing = 8
+
+        let planes = dataCollector.currentSpatialContext.planes
+        if planes.isEmpty {
+            let emptySurfaces = UILabel()
+            emptySurfaces.text = "No world surfaces detected yet."
+            emptySurfaces.textColor = .secondaryLabel
+            emptySurfaces.textAlignment = .center
+            emptySurfaces.font = .systemFont(ofSize: 15)
+            planesStack.addArrangedSubview(emptySurfaces)
+        } else {
+            for plane in planes {
+                let label = UILabel()
+                label.numberOfLines = 0
+                label.textColor = .label
+                label.font = .systemFont(ofSize: 15)
+                var text = String(format: "%@ — %.2f x %.2f m",
+                                  plane.classification.capitalized,
+                                  plane.width,
+                                  plane.height)
+                if plane.center != simd_float3.zero {
+                    text += String(format: "\ncenter: (%.2f, %.2f, %.2f)m",
+                                   plane.center.x,
+                                   plane.center.y,
+                                   plane.center.z)
+                }
+                label.text = text
+                planesStack.addArrangedSubview(label)
+            }
+        }
+        sectionsStack.addArrangedSubview(planesStack)
+
+        let content = UIStackView(arrangedSubviews: [titleLabel, sectionsStack])
         content.axis = .vertical
         content.spacing = 12
         content.layoutMargins = UIEdgeInsets(top: 12, left: 16, bottom: 16, right: 16)
